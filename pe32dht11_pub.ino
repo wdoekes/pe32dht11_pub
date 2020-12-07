@@ -23,6 +23,7 @@
 #include <ArduinoMqttClient.h>
 #include <DHTesp.h>
 #include <ESP8266WiFi.h>
+#include <SimpleKalmanFilter.h>
 
 /* In config.h, you should have:
 const char wifi_ssid[] = "<ssid>";
@@ -44,14 +45,6 @@ const char mqtt_topic[] = "some/topic";
  * We could use this to store updated/new passwords/ssids, etc..
  */
 
-// TODO: #include <SimpleKalmanFilter.h>
-// TODO: https://github.com/denyssene/SimpleKalmanFilter/blob/master/examples/BasicKalmanFilterExample/BasicKalmanFilterExample.ino
-//  SimpleKalmanFilter(e_mea, e_est, q);
-//  e_mea: Measurement Uncertainty
-//  e_est: Estimation Uncertainty
-//  q: Process Noise
-// SimpleKalmanFilter simpleKalmanFilter(2, 2, 0.01);
-
 /* We use the guid to store something unique to identify the device by.
  * For now, we'll populate it with the ESP8266 Wifi MAC address. */
 char guid[24]; // "EUI48:11:22:33:44:55:66"
@@ -60,8 +53,17 @@ const int DHTpin = 14; // D5 of ESP8266 (NodeMCU) is GPIO14
 
 DHTesp dht;
 
+/* SimpleKalmanFilter(e_mea, e_est, q);
+ *   e_mea: Measurement Uncertainty (we expect about +/-2 degrees of uncertainty)
+ *   e_est: Estimation Uncertainty (this will autocorrect)
+ *   q: Process Noise */
+SimpleKalmanFilter temperatureFilter(2, 2, 0.01);
+SimpleKalmanFilter humidityFilter(2, 2, 0.01);
+
 WiFiClient wifiClient;
 MqttClient mqttClient(wifiClient);
+
+int idx;
 
 void ensure_wifi();
 void ensure_mqtt();
@@ -90,47 +92,68 @@ void setup()
   // Initial connect
   ensure_wifi();
   ensure_mqtt();
+
+  // Train with -1 +1 offset values
+  float humidity_pct = dht.getHumidity();
+  float temperature_c = dht.getTemperature();
+  for (int i = 0; i < 20; ++i) {
+    int offset = (i % 3) - 2;
+    humidityFilter.updateEstimate(humidity_pct + offset);
+    temperatureFilter.updateEstimate(temperature_c + offset);
+  }
 }
 
 void loop()
 {
   float humidity_pct = dht.getHumidity();
   float temperature_c = dht.getTemperature();
+
+  humidity_pct = humidityFilter.updateEstimate(humidity_pct);
+  temperature_c = temperatureFilter.updateEstimate(temperature_c);
   float heat_index = dht.computeHeatIndex(temperature_c, humidity_pct, false);
 
   if (strcmp(dht.getStatusString(), "OK") != 0) {
     Serial.println("Sampling failed, waiting 30s before next attempt");
-    delay(30000); // 30s, or: dht.getMinimumSamplingPeriod()
+    delay(30000); // 30s
     return;
   }
 
-  Serial.print("Collected: device_id=");
+  Serial.print("values: device_id=");
   Serial.print(guid);
   Serial.print("&temperature_celcius=");
   Serial.print(temperature_c);
   Serial.print("&humidity_percent=");
   Serial.print(humidity_pct);
   Serial.print("&heat_index=");
-  Serial.println(heat_index);
+  Serial.println(heat_index); // apparent_temperature
 
-  Serial.print("Attempting push to broker topic ");
-  Serial.println(mqtt_topic);
 
-  ensure_wifi();
-  ensure_mqtt();
+  if ((idx++ % 2) == 1) {
+    // Sample every 30s, send every 60s.
+    Serial.print("Attempting push to broker topic ");
+    Serial.println(mqtt_topic);
 
-  mqttClient.beginMessage(mqtt_topic);
-  mqttClient.print("device_id=");
-  mqttClient.print(guid);
-  mqttClient.print("&temperature_celcius=");
-  mqttClient.print(temperature_c);
-  mqttClient.print("&humidity_percent=");
-  mqttClient.print(humidity_pct);
-  mqttClient.print("&heat_index=");
-  mqttClient.print(heat_index);
-  mqttClient.endMessage();
+    ensure_wifi();
+    ensure_mqtt();
 
-  delay(60000); // 60s, or 30s, or: dht.getMinimumSamplingPeriod()
+    mqttClient.beginMessage(mqtt_topic);
+    mqttClient.print("device_id=");
+    mqttClient.print(guid);
+    mqttClient.print("&temperature_celcius=");
+    mqttClient.print(temperature_c);
+    mqttClient.print("&humidity_percent=");
+    mqttClient.print(humidity_pct);
+    mqttClient.print("&heat_index=");
+    mqttClient.print(heat_index);
+    mqttClient.endMessage();
+  }
+
+#ifdef DEBUG
+  delay(dht.getMinimumSamplingPeriod());
+#else
+  // Make sure we sleep a lot, or the DHT11 heats up itself.
+  delay(30000); // 30s
+#endif
 }
 
 /**
